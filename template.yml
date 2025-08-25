@@ -1,0 +1,54 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: API + Lambda para chat via Amazon Bedrock (Claude 3 Haiku)
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 30
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        MODEL_ID: meta.llama3-8b-instruct-v1:0
+        BEDROCK_REGION: us-east-1
+
+Resources:
+  BedrockChatFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource: "*"
+        - CloudWatchLogsFullAccess
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi       
+            Path: /chat
+            Method: POST
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: ['POST', 'OPTIONS']
+        AllowHeaders: ['content-type']
+      StageName: dev                
+
+Outputs:
+  ApiId:
+    Description: ID da API HTTP
+    Value: !Ref HttpApi
+
+  ApiUrl:
+    Description: URL base da API
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/dev"
