@@ -28,6 +28,9 @@ def missing_env():
     if not MODEL:  miss.append("MODEL_ARN")
     return miss
 
+def add_id_header(resp):
+    resp.headers["X-Service"] = "flask-kb"
+    return resp
 
 @app.get("/ping")
 def ping():
