@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import os, traceback, boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-# ========= Config =========
+
 REGION = os.getenv("AWS_REGION", "us-east-1")
 KB_ID  = os.getenv("KNOWLEDGE_BASE_ID")
 MODEL  = os.getenv("MODEL_ARN")
@@ -16,7 +16,7 @@ SYSTEM_INSTRUCTIONS = (
 )
 
 app = Flask(__name__)
-app.config["JSON_AS_ASCII"] = False  # manter acentuação no JSON
+app.config["JSON_AS_ASCII"] = False  
 
 def kb_client():
     return boto3.client("bedrock-agent-runtime", region_name=REGION)
@@ -28,7 +28,7 @@ def missing_env():
     if not MODEL:  miss.append("MODEL_ARN")
     return miss
 
-# ========= Health / Diag =========
+
 @app.get("/ping")
 def ping():
     return jsonify({"ok": True})
@@ -40,13 +40,13 @@ def diag():
     if miss:
         return jsonify({"ok": False, "error": "Missing env vars", "missing": miss, "env": env}), 500
     try:
-        # Teste de retrieve (sem geração)
+        
         r = kb_client().retrieve(
             knowledgeBaseId=KB_ID,
             retrievalQuery={"text": "ping"},
             retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": 1}},
         )
-        # Teste de RAG (sem generationConfiguration para compatibilidade)
+        
         prompt = f"{SYSTEM_INSTRUCTIONS}\n\nPergunta: Diga 'ok' se você está funcionando."
         rag = kb_client().retrieve_and_generate(
             input={"text": prompt},
@@ -69,7 +69,7 @@ def diag():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc(), "env": env}), 500
 
-# ========= Chat =========
+
 @app.post("/chat")
 def chat():
     try:
@@ -82,7 +82,7 @@ def chat():
         if not user_msg:
             return jsonify({"error": "Body precisa conter JSON com o campo 'message'."}), 400
 
-        # Instruções empurradas para o próprio input (compatível com boto3 antigo)
+    
         final_prompt = f"{SYSTEM_INSTRUCTIONS}\n\nPergunta do usuário: {user_msg}"
 
         resp = kb_client().retrieve_and_generate(
@@ -105,7 +105,7 @@ def chat():
                     "score": ref.get("score")
                 })
 
-        # Fallback quando não houver fontes
+
         if not citations and "Não encontrei informações" not in answer:
             answer = "Não encontrei informações sobre isso na base de conhecimento."
 
@@ -116,7 +116,7 @@ def chat():
     except Exception as e:
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
-# ========= Main =========
+
 if __name__ == "__main__":
-    # Exporte antes: AWS_REGION, KNOWLEDGE_BASE_ID, MODEL_ARN
-    app.run(host="0.0.0.0", port=8080)
+
+    app.run(host="0.0.0.0", port=8081)
