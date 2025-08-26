@@ -6,8 +6,8 @@ import React, { useEffect, useRef, useState } from 'react'
 export type Msg = { role: 'user' | 'assistant'; content: string }
 type Citation = { uri: string; score?: number | null }
 
-// Caminho da API (usa o rewrite do next.config.ts)
-const API_PATH = '/api/bedrock'
+// Caminho da API (bate no rewrite do next.config.ts → Flask /chat)
+const API_PATH = '/api/chat'
 
 export default function BedrockClaudeChat() {
   const [input, setInput] = useState('')
@@ -17,9 +17,15 @@ export default function BedrockClaudeChat() {
     { role: 'assistant', content: 'Olá! Sou o Bedrock. Como posso te ajudar hoje?' },
   ])
   const [lastCitations, setLastCitations] = useState<Citation[]>([])
+  const [origin, setOrigin] = useState<string | null>(null) // X-Service do backend, se vier
 
   const listRef = useRef<HTMLDivElement | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+
+  // Foco ao montar
+  useEffect(() => {
+    textareaRef.current?.focus()
+  }, [])
 
   // Scroll automático
   useEffect(() => {
@@ -49,6 +55,9 @@ export default function BedrockClaudeChat() {
         body: JSON.stringify({ message: text, history: nextMessages }),
       })
 
+      // registra cabeçalho de origem se o proxy repassar (X-Service: flask-kb)
+      setOrigin(res.headers.get('x-service'))
+
       if (!res.ok) {
         const errTxt = await safeReadText(res)
         throw new Error(errTxt || `HTTP ${res.status}`)
@@ -67,7 +76,6 @@ export default function BedrockClaudeChat() {
 
       const reply = (data.answer ?? data.output ?? '').trim()
       setLastCitations(data.citations ?? [])
-
       setMessages((prev) => [...prev, { role: 'assistant', content: reply || '—' }])
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Erro desconhecido'
@@ -89,6 +97,7 @@ export default function BedrockClaudeChat() {
     setMessages([{ role: 'assistant', content: 'Novo chat iniciado. O que você quer fazer?' }])
     setError(null)
     setLastCitations([])
+    setOrigin(null)
     textareaRef.current?.focus()
   }
 
@@ -98,7 +107,10 @@ export default function BedrockClaudeChat() {
         <header className="flex items-center justify-between border-b pb-3 mb-4">
           <div>
             <h1 className="text-lg font-semibold text-gray-900">Chat – Bedrock (KB)</h1>
-            <p className="text-xs text-gray-600">Proxy: /api/bedrock → Flask /chat</p>
+            <p className="text-xs text-gray-600">
+              Proxy: <code>/api/chat</code> → Flask <code>/chat</code>
+              {origin ? <> • origem: <code>{origin}</code></> : null}
+            </p>
           </div>
           <button
             type="button"
