@@ -1,74 +1,79 @@
-'use client'
+'use client';
 
 import React, { useEffect, useRef, useState } from 'react'
 
-// Tipagem simples para o histórico de mensagens
+// Tipos
 export type Msg = { role: 'user' | 'assistant'; content: string }
+type Citation = { uri: string; score?: number | null }
 
-/**
- * Componente de chat para a rota interna /api/bedrock
- *
- * Melhorias aplicadas:
- * - Corrige a diretiva 'use client' e o import quebrado
- * - Remove espaços/indentação espúrios e organiza o JSX
- * - Corrige condição de corrida: a requisição agora envia o histórico *já* com a mensagem do usuário
- * - Scroll automático para a última mensagem
- * - Tratamento de erros mais claro
- * - Bloqueios de UI (loading) e acessibilidade
- */
+// Caminho da API (usa o rewrite do next.config.ts)
+const API_PATH = '/api/bedrock'
+
 export default function BedrockClaudeChat() {
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [messages, setMessages] = useState<Msg[]>([
-    { role: 'assistant', content: 'Olá! Sou o BedRock. Como posso te ajudar hoje?' },
+    { role: 'assistant', content: 'Olá! Sou o Bedrock. Como posso te ajudar hoje?' },
   ])
+  const [lastCitations, setLastCitations] = useState<Citation[]>([])
 
   const listRef = useRef<HTMLDivElement | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
-  // Mantém a lista rolada para o final quando novas mensagens chegam
+  // Scroll automático
   useEffect(() => {
-    if (!listRef.current) return
-    listRef.current.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' })
+    if (listRef.current) {
+      listRef.current.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' })
+    }
   }, [messages])
 
   async function sendMessage() {
     const text = input.trim()
     if (!text || loading) return
 
-    // Limpa UI imediatamente
     setInput('')
     setError(null)
+    setLastCitations([])
 
-    // Prepara histórico com a nova mensagem antes de chamar a API
     const userMsg: Msg = { role: 'user', content: text }
     const nextMessages = [...messages, userMsg]
     setMessages(nextMessages)
 
     setLoading(true)
     try {
-      const res = await fetch('/api/bedrock', {
+      const res = await fetch(API_PATH, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // o backend só usa "message"; "history" é opcional
         body: JSON.stringify({ message: text, history: nextMessages }),
       })
 
-      if (!res.ok) throw new Error(await safeReadText(res))
+      if (!res.ok) {
+        const errTxt = await safeReadText(res)
+        throw new Error(errTxt || `HTTP ${res.status}`)
+      }
 
-      const data = (await res.json()) as { output?: string; error?: string }
-      if (data.error) throw new Error(data.error)
+      // Backend retorna { answer, citations } (e às vezes { error, detail })
+      const data = await res.json() as {
+        answer?: string
+        output?: string
+        citations?: Citation[]
+        error?: string
+        detail?: string
+      }
 
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: (data.output ?? '').trim() },
-      ])
+      if (data.error || data.detail) throw new Error(data.error || data.detail)
+
+      const reply = (data.answer ?? data.output ?? '').trim()
+      setLastCitations(data.citations ?? [])
+
+      setMessages((prev) => [...prev, { role: 'assistant', content: reply || '—' }])
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Erro desconhecido'
       setError(msg)
     } finally {
       setLoading(false)
-      // Volta o foco para o textarea para continuar digitando
       textareaRef.current?.focus()
     }
   }
@@ -83,6 +88,7 @@ export default function BedrockClaudeChat() {
   function clearChat() {
     setMessages([{ role: 'assistant', content: 'Novo chat iniciado. O que você quer fazer?' }])
     setError(null)
+    setLastCitations([])
     textareaRef.current?.focus()
   }
 
@@ -91,8 +97,8 @@ export default function BedrockClaudeChat() {
       <div className="w-full max-w-3xl bg-white rounded-2xl shadow border p-4">
         <header className="flex items-center justify-between border-b pb-3 mb-4">
           <div>
-            <h1 className="text-lg font-semibold text-gray-900">Chat – Bedrock (BedRock)</h1>
-            <p className="text-xs text-gray-600">API interna /api/bedrock</p>
+            <h1 className="text-lg font-semibold text-gray-900">Chat – Bedrock (KB)</h1>
+            <p className="text-xs text-gray-600">Proxy: /api/bedrock → Flask /chat</p>
           </div>
           <button
             type="button"
@@ -115,12 +121,27 @@ export default function BedrockClaudeChat() {
                 }`}
               >
                 <div className="text-[11px] uppercase tracking-wider font-semibold text-gray-700 mb-1">
-                  {m.role === 'assistant' ? 'BedRock' : 'Você'}
+                  {m.role === 'assistant' ? 'Bedrock' : 'Você'}
                 </div>
                 {m.content}
               </div>
             </div>
           ))}
+
+          {!!lastCitations.length && (
+            <div className="mt-2 text-xs text-gray-700 bg-gray-50 border border-gray-200 rounded p-3">
+              <div className="font-semibold mb-1">Fontes</div>
+              <ul className="list-disc pl-5 space-y-1">
+                {lastCitations.map((c, i) => (
+                  <li key={i}>
+                    <code>{c.uri}</code>
+                    {typeof c.score === 'number' ? ` (score ${c.score.toFixed(3)})` : ''}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           {error && (
             <div className="text-red-700 text-sm bg-red-100 border border-red-300 rounded p-3">
               {error}
@@ -159,9 +180,5 @@ export default function BedrockClaudeChat() {
 
 // Lê texto de erro do Response sem quebrar se não for body-text
 async function safeReadText(res: Response) {
-  try {
-    return await res.text()
-  } catch {
-    return res.statusText || 'Erro HTTP'
-  }
+  try { return await res.text() } catch { return res.statusText || 'Erro HTTP' }
 }
