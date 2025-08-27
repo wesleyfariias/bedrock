@@ -112,3 +112,133 @@ def retrieve_kendra(query: str, top_k: int = 12):
     for x in items:
         key = (x["uri"], x["excerpt"][:80])
         if key in seen: 
+            continue
+        seen.add(key)
+        uniq.append(x)
+    return uniq[:top_k]
+
+# ===== Geração (Bedrock Runtime) =====
+def generate_with_bedrock_runtime(question: str, snippets: list[str]) -> str:
+    """
+    Usa Bedrock Runtime para gerar resposta condicionada ao contexto (snippets).
+    Suporta Claude 2 (prompt) e Claude 3 (messages).
+    """
+    model_id = MODEL_IDENTIFIER
+    context = "\n\n---\n".join(snippets)
+    if len(context) > 8000:
+        context = context[:8000]
+
+    # Claude 3 / Converse-style
+    if model_id.startswith("anthropic.claude-3") or model_id.startswith("arn:aws:bedrock:"):
+        body = {
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": (
+                        f"{SYSTEM_INSTRUCTIONS}\n\n"
+                        f"CONTEXTO:\n{context}\n\n"
+                        f"PERGUNTA: {question}\n\n"
+                        "Responda de forma concisa e ao final escreva uma seção 'Fontes' listando as URIs se houver."
+                    )}
+                ]}
+            ],
+            "max_tokens": 800,
+            "temperature": 0.2
+        }
+        resp = bedrock_rt.invoke_model(
+            modelId=model_id,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(body)
+        )
+        payload = json.loads(resp["body"].read())
+        # Tentativas de extração comuns (depende do modelo)
+        return (payload.get("output_text")
+                or payload.get("generation")
+                or payload.get("content", [{}])[0].get("text", "")
+                or "").strip()
+
+    # Claude 2.x (prompt Human/Assistant)
+    prompt = (
+        f"\n\nHuman: {SYSTEM_INSTRUCTIONS}\n\n"
+        f"CONTEXTO:\n{context}\n\n"
+        f"PERGUNTA: {question}\n\n"
+        "Responda de forma concisa e ao final escreva uma seção 'Fontes' listando as URIs se houver.\n"
+        "\n\nAssistant:"
+    )
+    body = {
+        "prompt": prompt,
+        "max_tokens_to_sample": 800,
+        "temperature": 0.2,
+        "stop_sequences": ["\n\nHuman:"]
+    }
+    resp = bedrock_rt.invoke_model(
+        modelId=model_id or "anthropic.claude-v2:1",
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps(body)
+    )
+    payload = json.loads(resp["body"].read())
+    return (payload.get("completion") or "").strip()
+
+# ===== Routes =====
+@app.get("/ping")
+def ping():
+    return jsonify({
+        "ok": True,
+        "bedrock_region": BEDROCK_REGION,
+        "kendra_region": KENDRA_REGION,
+        "model": MODEL_IDENTIFIER
+    })
+
+@app.post("/retrieve")
+def retrieve_only():
+    try:
+        data = request.get_json(force=True) or {}
+        q = (data.get("q") or data.get("message") or "").strip()
+        top_k = int(data.get("k") or 12)
+        if not q:
+            return jsonify({"error": "Informe 'q'"}), 400
+
+        hits = retrieve_kendra(q, top_k)
+        return jsonify({"hits": hits}), 200
+    except Exception as e:
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+@app.post("/chat")
+def chat():
+    try:
+        miss = missing_env()
+        if miss:
+            return jsonify({"error": "Missing env vars", "missing": miss}), 500
+
+        data = request.get_json(force=True) or {}
+        user_msg = (data.get("message") or "").strip()
+        k = int(data.get("k") or 12)
+        if not user_msg:
+            return jsonify({"error": "Body precisa conter JSON com o campo 'message'."}), 400
+
+        # 1) Retrieve no Kendra
+        k_hits = retrieve_kendra(user_msg, k)
+        if not k_hits:
+            return jsonify({
+                "answer": "Não encontrei informações sobre isso na base de conhecimento.",
+                "citations": []
+            }), 200
+
+        citations = [{"uri": h["uri"], "score": h["score"]} for h in k_hits]
+        snippets  = [h["excerpt"] for h in k_hits]
+
+        # 2) Geração usando somente o contexto recuperado
+        answer = generate_with_bedrock_runtime(user_msg, snippets) or \
+                 "Não encontrei informações sobre isso na base de conhecimento."
+
+        return jsonify({"answer": answer, "citations": citations}), 200
+
+    except (BotoCoreError, ClientError) as e:
+        return jsonify({"error": "AWS error", "detail": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
