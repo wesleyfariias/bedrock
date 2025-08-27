@@ -7,7 +7,7 @@ def _env(name, default=""):
     return (os.getenv(name, default) or "").strip()
 
 BEDROCK_REGION = _env("BEDROCK_REGION", "us-east-1")     # Bedrock costuma ficar em us-east-1
-KENDRA_REGION  = _env("KENDRA_REGION", _env("AWS_REGION", "sa-east-1"))  # onde está seu índice
+KENDRA_REGION  = _env("KENDRA_REGION", _env("AWS_REGION", "us-east-1"))  # onde está seu índice
 
 KENDRA_INDEX_ID = _env("KENDRA_INDEX_ID")      # obrigatório p/ retrieve
 MODEL_ID       = _env("MODEL_ID")              # opcional (on-demand)
