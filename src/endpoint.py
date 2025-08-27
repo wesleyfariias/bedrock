@@ -14,7 +14,7 @@ MODEL_ID       = _env("MODEL_ID")              # opcional (on-demand)
 MODEL_ARN      = _env("MODEL_ARN")             # opcional (provisioned/profile)
 
 # Fallback on-demand atual (ajuste se quiser outro)
-DEFAULT_ON_DEMAND = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+DEFAULT_ON_DEMAND = "anthropic.claude-v2:1"
 
 def _resolve_model_identifier() -> str:
     """
