@@ -2,15 +2,44 @@ from flask import Flask, request, jsonify
 import os, re, json, traceback, boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-# =======================
-# Config / Env
-# =======================
-REGION = os.getenv("AWS_REGION", "us-east-1")
-KENDRA_INDEX_ID = os.getenv("KENDRA_INDEX_ID")     # obrigatório p/ usar Kendra
-MODEL_ARN = os.getenv("MODEL_ARN")                 # ex.: arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2:1
+# ===== Regiões separadas =====
+def _env(name, default=""):
+    return (os.getenv(name, default) or "").strip()
 
-# Cliente do Bedrock Runtime (geração)
-bedrock_rt = boto3.client("bedrock-runtime", region_name=REGION)
+BEDROCK_REGION = _env("BEDROCK_REGION", "us-east-1")     # Bedrock costuma ficar em us-east-1
+KENDRA_REGION  = _env("KENDRA_REGION", _env("AWS_REGION", "sa-east-1"))  # onde está seu índice
+
+KENDRA_INDEX_ID = _env("KENDRA_INDEX_ID")      # obrigatório p/ retrieve
+MODEL_ID       = _env("MODEL_ID")              # opcional (on-demand)
+MODEL_ARN      = _env("MODEL_ARN")             # opcional (provisioned/profile)
+
+# Fallback on-demand atual (ajuste se quiser outro)
+DEFAULT_ON_DEMAND = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+def _resolve_model_identifier() -> str:
+    """
+    Retorna um identificador aceito pelo Bedrock:
+    - Se for ARN de provisioned/profile => usa o ARN inteiro
+    - Se for ARN de foundation-model => extrai o modelId
+    - Senão usa MODEL_ID; se vazio, usa fallback on-demand
+    """
+    arn = MODEL_ARN
+    if arn.startswith("arn:aws:bedrock:"):
+        # Provisioned / Inference Profiles são aceitos como ARN
+        if any(p in arn for p in (":provisioned-model/", ":application-inference-profile/", ":system-inference-profile/")):
+            return arn
+        # Foundation model ARN -> extrai modelId (ex.: .../foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0)
+        if "/foundation-model/" in arn:
+            return arn.split("/foundation-model/")[-1]
+        # Qualquer outro ARN: melhor não usar
+    return MODEL_ID or DEFAULT_ON_DEMAND
+
+MODEL_IDENTIFIER = _resolve_model_identifier()
+
+# ===== Clients =====
+bedrock_rt = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+def kendra_client():
+    return boto3.client("kendra", region_name=KENDRA_REGION)
 
 SYSTEM_INSTRUCTIONS = (
     "Você é uma IA que responde em português, de forma objetiva, "
@@ -22,29 +51,20 @@ SYSTEM_INSTRUCTIONS = (
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
 
-# =======================
-# Helpers
-# =======================
-def kendra_client():
-    return boto3.client("kendra", region_name=REGION)
-
+# ===== Helpers =====
 def missing_env():
     miss = []
-    if not REGION:           miss.append("AWS_REGION")
-    if not MODEL_ARN:        miss.append("MODEL_ARN")
     if not KENDRA_INDEX_ID:  miss.append("KENDRA_INDEX_ID")
+    # Não exigimos MODEL_ARN: usamos MODEL_ID ou fallback
     return miss
 
 @app.after_request
 def add_id_header(resp):
     resp.headers["X-Service"] = "flask-kendra"
+    resp.headers["X-Bedrock-Region"] = BEDROCK_REGION
+    resp.headers["X-Kendra-Region"]  = KENDRA_REGION
+    resp.headers["X-Model"]          = MODEL_IDENTIFIER
     return resp
-
-def _resolve_model_id(s: str) -> str:
-    # aceita ARN completo ou o ID curto (ex.: anthropic.claude-v2:1)
-    if s and s.startswith("arn:aws:bedrock:"):
-        return s.split("foundation-model/")[-1]
-    return s
 
 def make_query_variants(q: str):
     """Gera variações úteis para IDs: US-5270, US 5270, US5270, 5270, etc."""
@@ -63,9 +83,7 @@ def make_query_variants(q: str):
             out.append(v); seen.add(v)
     return out
 
-# =======================
-# Retrieval (Kendra)
-# =======================
+# ===== Retrieval (Kendra) =====
 def retrieve_kendra(query: str, top_k: int = 12):
     cli = kendra_client()
     items = []
@@ -94,127 +112,3 @@ def retrieve_kendra(query: str, top_k: int = 12):
     for x in items:
         key = (x["uri"], x["excerpt"][:80])
         if key in seen: 
-            continue
-        seen.add(key)
-        uniq.append(x)
-    return uniq[:top_k]
-
-# =======================
-# Geração (Bedrock Runtime)
-# =======================
-def generate_with_bedrock_runtime(question: str, snippets: list[str]) -> str:
-    """
-    Usa Bedrock Runtime diretamente (sem Knowledge Base) para gerar a resposta,
-    condicionada estritamente ao contexto (snippets).
-    """
-    model_id = _resolve_model_id(MODEL_ARN or "anthropic.claude-v2:1")
-    context = "\n\n---\n".join(snippets)
-    if len(context) > 8000:
-        context = context[:8000]
-
-    # Suporte principal: Anthropic Claude v2.x (prompt estilo Human/Assistant)
-    if model_id.startswith("anthropic.claude-2") or model_id.startswith("anthropic.claude-v2"):
-        prompt = (
-            f"\n\nHuman: {SYSTEM_INSTRUCTIONS}\n\n"
-            f"CONTEXTO:\n{context}\n\n"
-            f"PERGUNTA: {question}\n\n"
-            "Responda de forma concisa e ao final escreva uma seção 'Fontes' listando as URIs se houver.\n"
-            "\n\nAssistant:"
-        )
-        body = {
-            "prompt": prompt,
-            "max_tokens_to_sample": 800,
-            "temperature": 0.2,
-            "stop_sequences": ["\n\nHuman:"]
-        }
-        resp = bedrock_rt.invoke_model(
-            modelId=model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body)
-        )
-        payload = json.loads(resp["body"].read())
-        return (payload.get("completion") or "").strip()
-
-    # (Opcional) modelos novos podem usar outro schema; fallback simples:
-    # Tente tratar como Claude 3 messages (se alguém trocar o MODEL_ARN mais tarde).
-    body = {
-        "messages": [
-            {"role": "user", "content": [
-                {"type": "text", "text": f"{SYSTEM_INSTRUCTIONS}\n\nCONTEXTO:\n{context}\n\nPERGUNTA: {question}"}
-            ]}
-        ],
-        "max_tokens": 800,
-        "temperature": 0.2
-    }
-    resp = bedrock_rt.invoke_model(
-        modelId=model_id,
-        contentType="application/json",
-        accept="application/json",
-        body=json.dumps(body)
-    )
-    payload = json.loads(resp["body"].read())
-    # Claude 3 costuma retornar em payload['output'][0]['content'][0]['text'] ou 'output_text'
-    return (payload.get("output_text")
-            or payload.get("generation")
-            or "").strip()
-
-# =======================
-# Routes
-# =======================
-@app.get("/ping")
-def ping():
-    return jsonify({"ok": True})
-
-@app.post("/retrieve")
-def retrieve_only():
-    try:
-        data = request.get_json(force=True) or {}
-        q = (data.get("q") or data.get("message") or "").strip()
-        top_k = int(data.get("k") or 12)
-        if not q:
-            return jsonify({"error": "Informe 'q'"}), 400
-
-        hits = retrieve_kendra(q, top_k)
-        return jsonify({"hits": hits}), 200
-    except Exception as e:
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
-
-@app.post("/chat")
-def chat():
-    try:
-        miss = missing_env()
-        if miss:
-            return jsonify({"error": "Missing env vars", "missing": miss}), 500
-
-        data = request.get_json(force=True) or {}
-        user_msg = (data.get("message") or "").strip()
-        k = int(data.get("k") or 12)
-        if not user_msg:
-            return jsonify({"error": "Body precisa conter JSON com o campo 'message'."}), 400
-
-        # 1) Retrieve no Kendra
-        k_hits = retrieve_kendra(user_msg, k)
-        if not k_hits:
-            return jsonify({
-                "answer": "Não encontrei informações sobre isso na base de conhecimento.",
-                "citations": []
-            }), 200
-
-        citations = [{"uri": h["uri"], "score": h["score"]} for h in k_hits]
-        snippets  = [h["excerpt"] for h in k_hits]
-
-        # 2) Geração usando somente o contexto recuperado
-        answer = generate_with_bedrock_runtime(user_msg, snippets) or \
-                 "Não encontrei informações sobre isso na base de conhecimento."
-
-        return jsonify({"answer": answer, "citations": citations}), 200
-
-    except (BotoCoreError, ClientError) as e:
-        return jsonify({"error": "AWS error", "detail": str(e)}), 500
-    except Exception as e:
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
