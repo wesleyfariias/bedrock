@@ -8,4 +8,8 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default nextConfig;
+export default {
+  async rewrites() {
+    return [{ source: '/api/chat', destination: 'http://127.0.0.1:8081/chat' }];
+  },
+};
