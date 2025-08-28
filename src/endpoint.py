@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import os, re, json, traceback, boto3
 from botocore.exceptions import BotoCoreError, ClientError
+import concurrent.futures  # <- para executar Kendra e rascunho em paralelo
 
 # ====================== ENV / REGIÕES ======================
 def _env(name, default=""):
@@ -221,6 +222,90 @@ def generate_with_bedrock_runtime(question: str, snippets: list[str], creative: 
     payload = json.loads(resp["body"].read())
     return (payload.get("completion") or "").strip()
 
+# ====================== HELPERS (HÍBRIDO) ======================
+def _invoke_bedrock_any(prompt_text: str, max_tokens: int = 900, temperature: float = 0.2) -> str:
+    """Invoca o Bedrock (Claude 2.x via prompt ou Claude 3 via messages) com texto simples."""
+    model_id = MODEL_IDENTIFIER
+
+    # Claude 3 (messages)
+    if model_id.startswith("arn:aws:bedrock:") or model_id.startswith("anthropic.claude-3"):
+        body = {
+            "messages": [{"role": "user", "content": [{"type": "text", "text": prompt_text}]}],
+            "max_tokens": max_tokens,
+            "temperature": temperature
+        }
+        resp = bedrock_rt.invoke_model(
+            modelId=model_id,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(body)
+        )
+        payload = json.loads(resp["body"].read())
+        return (payload.get("output_text")
+                or payload.get("generation")
+                or (payload.get("content") or [{}])[0].get("text", "")
+                or "").strip()
+
+    # Claude 2.x (prompt)
+    body = {
+        "prompt": f"\n\nHuman: {prompt_text}\n\nAssistant:",
+        "max_tokens_to_sample": max_tokens,
+        "temperature": temperature,
+        "stop_sequences": ["\n\nHuman:"]
+    }
+    resp = bedrock_rt.invoke_model(
+        modelId=model_id or "anthropic.claude-v2:1",
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps(body)
+    )
+    payload = json.loads(resp["body"].read())
+    return (payload.get("completion") or "").strip()
+
+def general_draft(question: str) -> str:
+    """Rascunho curto usando conhecimento geral (sem citar fontes)."""
+    prompt = (
+        "Responda em português, de forma breve (até 8 linhas), neutra e técnica, "
+        "usando apenas conhecimento geral, SEM inventar referências e SEM citar fontes.\n\n"
+        f"Pergunta: {question}"
+    )
+    return _invoke_bedrock_any(prompt, max_tokens=350, temperature=0.3)
+
+def synthesize_hybrid_answer(question: str, kendra_snippets: list[str], general_text: str, citations: list[dict]) -> str:
+    """
+    Produz resposta final única:
+    - Prioriza Kendra quando houver contexto
+    - Complementa com 'Complemento geral (sem fonte Kendra)' quando fizer sentido
+    - Sempre finaliza com 'Fontes (Kendra)'
+    """
+    kendra_context = "\n\n".join(f"- {s}" for s in kendra_snippets) if kendra_snippets else "(vazio)"
+    fontes = "\n".join(f"- {c.get('uri','')}" for c in citations if c.get("uri"))
+
+    synthesis_prompt = (
+        "Você é uma IA sênior. Priorize fielmente o que está no CONTEXTO_KENDRA abaixo; "
+        "se necessário, complemente com o TEXTO_GERAL, deixando claro esse complemento. "
+        "Não invente fatos que contradigam o Kendra. Seja direto e organizado.\n\n"
+        f"PERGUNTA:\n{question}\n\n"
+        f"CONTEXTO_KENDRA (trechos):\n{kendra_context}\n\n"
+        f"TEXTO_GERAL (rascunho curto):\n{general_text or '(vazio)'}\n\n"
+        "Monte uma resposta única. Se usar o texto geral, inclua um bloco: "
+        "\"Complemento geral (sem fonte Kendra): ...\". "
+        "Ao final, inclua uma seção 'Fontes (Kendra):' listando as URIs quando houver; "
+        "se não houver, escreva 'Fontes (Kendra): (nenhuma)'."
+    )
+
+    final = _invoke_bedrock_any(synthesis_prompt, max_tokens=1200, temperature=0.2)
+    if not final.strip():
+        if kendra_snippets:
+            return (
+                "Não consegui sintetizar via modelo agora, mas encontrei trechos no Kendra.\n\n"
+                f"Fontes (Kendra):\n{fontes or '(nenhuma)'}"
+            )
+        return "Não encontrei informações no Kendra e não foi possível gerar um complemento agora."
+    if "Fontes (Kendra):" not in final:
+        final += "\n\nFontes (Kendra):\n" + (fontes or "(nenhuma)")
+    return final
+
 # ====================== ROTAS ======================
 @app.get("/ping")
 def ping():
@@ -314,6 +399,60 @@ def chat():
                 "citations": [],
                 "debug": {"mode": mode, "snippets": 0}
             }), 200
+
+    except (BotoCoreError, ClientError) as e:
+        return jsonify({"error": "AWS error", "detail": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+# ====================== NOVO ENDPOINT: CHAT HÍBRIDO ======================
+@app.post("/chat-hybrid")
+def chat_hybrid():
+    """
+    Orquestração híbrida:
+    - Executa retrieve no Kendra e rascunho geral em paralelo
+    - Sintetiza resposta única priorizando Kendra e complementando quando necessário
+    """
+    try:
+        miss = missing_env()
+        if miss:
+            return jsonify({"error": "Missing env vars", "missing": miss}), 500
+
+        data = request.get_json(force=True) or {}
+        user_msg = (data.get("message") or data.get("q") or "").strip()
+        k = int(data.get("k") or 8)  # top-k menor para respostas mais focadas
+
+        if not user_msg:
+            return jsonify({"error": "Body precisa conter JSON com o campo 'message'."}), 400
+
+        # Executa Kendra e rascunho geral em paralelo
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            fut_kendra = ex.submit(retrieve_kendra, user_msg, k)
+            fut_draft  = ex.submit(general_draft, user_msg)
+
+            try:
+                k_hits = fut_kendra.result(timeout=18)
+            except Exception as e:
+                print("[hybrid] Kendra error:", e)
+                k_hits = []
+
+            try:
+                g_text = fut_draft.result(timeout=18)
+            except Exception as e:
+                print("[hybrid] draft error:", e)
+                g_text = ""
+
+        citations = [{"uri": h["uri"], "score": h["score"]} for h in k_hits]
+        snippets  = [h["excerpt"] for h in k_hits]
+
+        # Síntese final
+        final_answer = synthesize_hybrid_answer(user_msg, snippets, g_text, citations)
+
+        return jsonify({
+            "answer": final_answer,
+            "citations": citations,
+            "debug": {"mode": "hybrid", "snippets": len(snippets), "has_general": bool(g_text.strip())}
+        }), 200
 
     except (BotoCoreError, ClientError) as e:
         return jsonify({"error": "AWS error", "detail": str(e)}), 500
