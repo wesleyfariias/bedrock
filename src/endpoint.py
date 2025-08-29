@@ -1,464 +1,156 @@
+import os, json, boto3
 from flask import Flask, request, jsonify
-import os, re, json, traceback, boto3
-from botocore.exceptions import BotoCoreError, ClientError
-import concurrent.futures  # <- para executar Kendra e rascunho em paralelo
 
-# ====================== ENV / REGIÕES ======================
-def _env(name, default=""):
-    return (os.getenv(name, default) or "").strip()
+REGION = os.getenv("BEDROCK_REGION", "us-east-1")
+MODEL_ID = os.getenv("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
+KENDRA_INDEX_ID = os.getenv("KENDRA_INDEX_ID")
 
-BEDROCK_REGION   = _env("BEDROCK_REGION", "us-east-1")
-KENDRA_REGION    = _env("KENDRA_REGION", _env("AWS_REGION", "us-east-1"))
-
-KENDRA_INDEX_ID  = _env("KENDRA_INDEX_ID")            # obrigatório p/ retrieve
-KENDRA_LANGUAGE  = _env("KENDRA_LANGUAGE")            # opcional (ex.: "pt")
-ALLOW_CREATIVE   = _env("ALLOW_CREATIVE", "true").lower() == "true"
-
-MODEL_ID         = _env("MODEL_ID")                   # opcional (on-demand)
-MODEL_ARN        = _env("MODEL_ARN")                  # opcional (provisioned/profile)
-DEFAULT_ON_DEMAND = "anthropic.claude-v2:1"
-
-def _resolve_model_identifier() -> str:
-    arn = MODEL_ARN
-    if arn.startswith("arn:aws:bedrock:"):
-        if any(p in arn for p in (":provisioned-model/", ":application-inference-profile/", ":system-inference-profile/")):
-            return arn  # pode usar ARN direto
-        if "/foundation-model/" in arn:
-            return arn.split("/foundation-model/")[-1]
-    return MODEL_ID or DEFAULT_ON_DEMAND
-
-MODEL_IDENTIFIER = _resolve_model_identifier()
-
-# ====================== CLIENTES ======================
-bedrock_rt = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
-def kendra_client():
-    return boto3.client("kendra", region_name=KENDRA_REGION)
-
-# ====================== INSTRUÇÕES ======================
-SYSTEM_INSTRUCTIONS_STRICT = (
-    "Você é uma IA que responde em português, de forma objetiva, "
-    "USANDO EXCLUSIVAMENTE o CONTEXTO fornecido. "
-    "Se o contexto não trouxer evidências suficientes, responda exatamente: "
-    "\"Não encontrei informações sobre isso na base de conhecimento.\" "
-    "Ao final, inclua uma seção 'Fontes' listando as URIs se houver."
-)
-
-SYSTEM_INSTRUCTIONS_CREATIVE = (
-    "Você é uma IA que responde em português, de forma objetiva. "
-    "Use o CONTEXTO fornecido quando existir. "
-    "Se o pedido envolver criar/propor/exemplificar, você PODE extrapolar e gerar conteúdo novo "
-    "com base em boas práticas. Deixe claro o que veio do CONTEXTO e o que é Proposta. "
-    "Se não houver contexto, ainda assim produza uma Proposta. "
-    "Ao final, inclua 'Fontes' com URIs quando usar o CONTEXTO; caso contrário, escreva 'Fontes: (proposta, sem fontes)'."
-)
+brt = boto3.client("bedrock-runtime", region_name=REGION)
+kendra = boto3.client("kendra", region_name=REGION)
 
 app = Flask(__name__)
-app.config["JSON_AS_ASCII"] = False
 
-# ====================== HELPERS ======================
-def missing_env():
-    miss = []
-    if not KENDRA_INDEX_ID:  miss.append("KENDRA_INDEX_ID")
-    return miss
+def kendra_search(query: str, top_k: int = 8):
+    if not KENDRA_INDEX_ID:
+        return [], []
+    try:
+        res = kendra.query(indexId=KENDRA_INDEX_ID, queryText=query, pageSize=top_k)
+    except Exception:
+        return [], []
+    ctx_chunks, sources = [], []
+    for item in res.get("ResultItems", []):
+        if "DocumentExcerpt" in item and "Text" in item["DocumentExcerpt"]:
+            ctx_chunks.append(item["DocumentExcerpt"]["Text"])
+        title = (item.get("DocumentTitle") or {}).get("Text") or "Fonte sem título"
+        link = None
+        for attr in item.get("DocumentAttributes", []):
+            if attr.get("Key") == "DocumentURI":
+                sv = attr.get("Value", {}).get("StringValue")
+                if sv:
+                    link = sv
+                    break
+        sources.append({"title": title, "url": link})
+    return ctx_chunks, sources
 
-@app.after_request
-def add_id_header(resp):
-    resp.headers["X-Service"] = "flask-kendra"
-    resp.headers["X-Bedrock-Region"] = BEDROCK_REGION
-    resp.headers["X-Kendra-Region"]  = KENDRA_REGION
-    resp.headers["X-Model"]          = MODEL_IDENTIFIER
-    return resp
+HYBRID_JSON_INSTRUCTION = """
+Você é um assistente técnico em PORTUGUÊS que combina BASE DE CONHECIMENTO (KB via Kendra) e conhecimento técnico geral.
 
-def make_query_variants(q: str):
-    """Gera variações úteis para IDs: US-5270, US 5270, US5270, 5270, etc."""
-    variants = [q]
-    m = re.search(r'\b([A-Za-z]{1,8})[-\s]?(\d{2,10})\b', q)
-    if m:
-        prefix, num = m.group(1).upper(), m.group(2)
-        variants += [
-            f"{prefix}-{num}", f"{prefix} {num}", f"{prefix}{num}",
-            f"{num}", f"user story {num}", f"user story #{num}",
-            f"US-{num}", f"US {num}", f"US{num}",
-        ]
-    out, seen = [], set()
-    for v in variants:
-        if v not in seen:
-            out.append(v); seen.add(v)
-    return out
+OBJETIVO
+- Responder ao usuário gerando artefatos úteis (ex.: casos de teste, critérios, checklist), usando fatos da KB e completando criativamente o que faltar.
 
-# ====================== RETRIEVAL (KENDRA) ======================
-def _extract_excerpt(item: dict) -> str:
-    """Tenta extrair um trecho de texto independente do tipo do item."""
-    # 1) DocumentExcerpt.Text
-    excerpt = item.get("DocumentExcerpt", {}).get("Text") or ""
-    if excerpt:
-        return excerpt
+POLÍTICA DE EVIDÊNCIAS
+- PRIORIZE a KB para fatos (regras existentes, IDs, trechos literais, decisões já tomadas).
+- NUNCA invente fatos da KB (IDs, métricas, decisões). Se faltar, crie como proposta técnica [AI].
+- Rotule cada item com sua origem explícita: use “[KB]” quando vier da base, “[AI]” quando for criação/boa prática.
 
-    # 2) AdditionalAttributes: AnswerText / PassageText
-    for aa in item.get("AdditionalAttributes", []):
-        if aa.get("ValueType") == "TEXT_WITH_HIGHLIGHTS_VALUE":
-            tw = aa.get("Value", {}).get("TextWithHighlightsValue", {})
-            if tw.get("Text"):
-                return tw["Text"]
+FORMATO DE SAÍDA (JSON VÁLIDO)
+- Responda APENAS com um JSON que siga o schema abaixo (sem texto fora do JSON):
 
-        # alguns SDKs usam Key/Value sem ValueType
-        if aa.get("Key") in ("AnswerText", "PassageText"):
-            tw = aa.get("Value", {}).get("TextWithHighlightsValue", {})
-            if tw.get("Text"):
-                return tw["Text"]
+{
+  "summary": "string (resumo dos pontos-chave; rotule trechos com [KB] ou [AI])",
+  "artifacts": {
+    "test_cases": [
+      {
+        "id": "TC-001",
+        "title": "string [AI]",
+        "type": "functional|negative|nonfunctional",
+        "steps": ["passo 1", "passo 2", "..."],
+        "expected_result": "string",
+        "tags": ["UI","API","Regression"],
+        "traceability": ["US-1234","AC-1"]  // referencie IDs reais da KB quando existirem; não invente
+      }
+    ],
+    "acceptance_criteria": ["AC-1: ... [KB|AI]", "AC-2: ... [KB|AI]"],
+    "validation_checklist": ["item ... [AI]", "..."],
+    "risks": ["risco ... [AI]"],
+    "open_questions": ["pergunta ... [AI]"]
+  },
+  "sources": [
+    {"title":"string","url":"string|null"}
+  ]
+}
 
-    return ""
+REGRAS DE CONTEÚDO
+- Gere 5–12 casos de teste variados (funcionais, negativos e não-funcionais) quando solicitado.
+- Traga exemplos práticos e critérios mensuráveis (ex.: tempos, formatos, máscaras) somente se estiverem na KB [KB] ou como proposta [AI].
+- Em conflitos entre KB e suposições, prevalece a KB (explique no resumo).
+- Se a KB não retornar nada, produza tudo como [AI] e use "sources": [].
 
-def retrieve_kendra(query: str, top_k: int = 12):
-    cli = kendra_client()
-    items = []
-    for qv in make_query_variants(query):
-        resp = None
-        last_err = None
+ESTILO
+- Objetivo, técnico e direto.
+- Português do Brasil.
+- Sem rodeios; nada fora do JSON.
 
-        # tenta com e sem LanguageCode (se KENDRA_LANGUAGE vazio, só sem)
-        attempts = [False] if not KENDRA_LANGUAGE else [True, False]
-        for use_lang in attempts:
+ENTRADA DO USUÁRIO:
+{user_msg}
+
+CONTEXTO DA KB (texto bruto; pode estar vazio):
+{context}
+"""
+
+
+def build_hybrid_prompt(user_msg: str, context: str) -> str:
+    return f"""{HYBRID_JSON_INSTRUCTION}
+
+[ENTRADA DO USUÁRIO]
+{user_msg}
+
+[CONTEXTO DA KB]
+{context if context.strip() else "(sem resultados)"}"""
+
+def converse_json(prompt: str, max_tokens: int = 1400, temperature: float = 0.3):
+    # Pede JSON e tenta fazer "auto-repair" se vier com texto extra
+    resp = brt.converse(
+        modelId=MODEL_ID,
+        messages=[{"role":"user","content":[{"text":prompt}]}],
+        inferenceConfig={"maxTokens": max_tokens, "temperature": temperature},
+    )
+    raw = "".join(p.get("text","") for p in resp["output"]["message"]["content"])
+    # Tentativa direta
+    try:
+        return json.loads(raw)
+    except Exception:
+        # heurística simples: procurar primeiro { ... } maior
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = raw[start:end+1]
             try:
-                params = {
-                    "IndexId": KENDRA_INDEX_ID,
-                    "QueryText": qv,
-                    "PageSize": min(top_k, 50),
-                }
-                if use_lang:
-                    params["LanguageCode"] = KENDRA_LANGUAGE
-                resp = cli.query(**params)
-                break
-            except Exception as e:
-                last_err = e
-
-        if resp is None:
-            print(f"[KENDRA] query FAILED for '{qv}' (lang={'on' if KENDRA_LANGUAGE else 'off'}): {last_err}")
-            continue
-
-        for it in resp.get("ResultItems", []):
-            if it.get("Type") not in ("DOCUMENT", "ANSWER", "QUESTION_ANSWER"):
-                continue
-            uri = it.get("DocumentURI") or ""
-            excerpt = _extract_excerpt(it).strip()
-            if not excerpt:
-                continue
-            items.append({"uri": uri or "(sem URI)", "excerpt": excerpt, "score": None})
-
-        if len(items) >= top_k:
-            break
-
-    # dedup por (uri, início do texto)
-    uniq, seen = [], set()
-    for x in items:
-        key = (x["uri"], x["excerpt"][:120])
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(x)
-    print(f"[KENDRA] retrieved {len(uniq[:top_k])} items for '{query}'")
-    return uniq[:top_k]
-
-# ====================== GERAÇÃO (BEDROCK RUNTIME) ======================
-def generate_with_bedrock_runtime(question: str, snippets: list[str], creative: bool) -> str:
-    """Gera resposta condicionada ao contexto (snippets). Suporta Claude 2 (prompt) e 3 (messages)."""
-    model_id = MODEL_IDENTIFIER
-    instructions = SYSTEM_INSTRUCTIONS_CREATIVE if creative else SYSTEM_INSTRUCTIONS_STRICT
-
-    context = "\n\n---\n".join(snippets)
-    # limitar contexto para evitar payload gigante
-    if len(context) > 12000:
-        context = context[:12000]
-
-    # Modelos Claude 3 (messages)
-    if model_id.startswith("arn:aws:bedrock:") or model_id.startswith("anthropic.claude-3"):
-        body = {
-            "messages": [
-                {"role": "user", "content": [
-                    {"type": "text", "text": (
-                        f"{instructions}\n\n"
-                        f"CONTEXTO:\n{context}\n\n"
-                        f"PERGUNTA: {question}\n"
-                    )}
-                ]}
-            ],
-            "max_tokens": 900,
-            "temperature": 0.2
-        }
-        resp = bedrock_rt.invoke_model(
-            modelId=model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body)
-        )
-        payload = json.loads(resp["body"].read())
-        # tentativas de extração
-        return (payload.get("output_text")
-                or payload.get("generation")
-                or (payload.get("content") or [{}])[0].get("text", "")
-                or "").strip()
-
-    # Claude 2.x (prompt)
-    prompt = (
-        f"\n\nHuman: {instructions}\n\n"
-        f"CONTEXTO:\n{context}\n\n"
-        f"PERGUNTA: {question}\n\n"
-        "Responda de forma objetiva.\n"
-        "Ao final escreva uma seção 'Fontes' listando as URIs se houver.\n"
-        "\n\nAssistant:"
-    )
-    body = {
-        "prompt": prompt,
-        "max_tokens_to_sample": 900,
-        "temperature": 0.2,
-        "stop_sequences": ["\n\nHuman:"]
-    }
-    resp = bedrock_rt.invoke_model(
-        modelId=model_id or "anthropic.claude-v2:1",
-        contentType="application/json",
-        accept="application/json",
-        body=json.dumps(body)
-    )
-    payload = json.loads(resp["body"].read())
-    return (payload.get("completion") or "").strip()
-
-# ====================== HELPERS (HÍBRIDO) ======================
-def _invoke_bedrock_any(prompt_text: str, max_tokens: int = 900, temperature: float = 0.2) -> str:
-    """Invoca o Bedrock (Claude 2.x via prompt ou Claude 3 via messages) com texto simples."""
-    model_id = MODEL_IDENTIFIER
-
-    # Claude 3 (messages)
-    if model_id.startswith("arn:aws:bedrock:") or model_id.startswith("anthropic.claude-3"):
-        body = {
-            "messages": [{"role": "user", "content": [{"type": "text", "text": prompt_text}]}],
-            "max_tokens": max_tokens,
-            "temperature": temperature
-        }
-        resp = bedrock_rt.invoke_model(
-            modelId=model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body)
-        )
-        payload = json.loads(resp["body"].read())
-        return (payload.get("output_text")
-                or payload.get("generation")
-                or (payload.get("content") or [{}])[0].get("text", "")
-                or "").strip()
-
-    # Claude 2.x (prompt)
-    body = {
-        "prompt": f"\n\nHuman: {prompt_text}\n\nAssistant:",
-        "max_tokens_to_sample": max_tokens,
-        "temperature": temperature,
-        "stop_sequences": ["\n\nHuman:"]
-    }
-    resp = bedrock_rt.invoke_model(
-        modelId=model_id or "anthropic.claude-v2:1",
-        contentType="application/json",
-        accept="application/json",
-        body=json.dumps(body)
-    )
-    payload = json.loads(resp["body"].read())
-    return (payload.get("completion") or "").strip()
-
-def general_draft(question: str) -> str:
-    """Rascunho curto usando conhecimento geral (sem citar fontes)."""
-    prompt = (
-        "Responda em português, de forma breve (até 8 linhas), neutra e técnica, "
-        "usando apenas conhecimento geral, SEM inventar referências e SEM citar fontes.\n\n"
-        f"Pergunta: {question}"
-    )
-    return _invoke_bedrock_any(prompt, max_tokens=350, temperature=0.3)
-
-def synthesize_hybrid_answer(question: str, kendra_snippets: list[str], general_text: str, citations: list[dict]) -> str:
-    """
-    Produz resposta final única:
-    - Prioriza Kendra quando houver contexto
-    - Complementa com 'Complemento geral (sem fonte Kendra)' quando fizer sentido
-    - Sempre finaliza com 'Fontes (Kendra)'
-    """
-    kendra_context = "\n\n".join(f"- {s}" for s in kendra_snippets) if kendra_snippets else "(vazio)"
-    fontes = "\n".join(f"- {c.get('uri','')}" for c in citations if c.get("uri"))
-
-    synthesis_prompt = (
-        "Você é uma IA sênior. Priorize fielmente o que está no CONTEXTO_KENDRA abaixo; "
-        "se necessário, complemente com o TEXTO_GERAL, deixando claro esse complemento. "
-        "Não invente fatos que contradigam o Kendra. Seja direto e organizado.\n\n"
-        f"PERGUNTA:\n{question}\n\n"
-        f"CONTEXTO_KENDRA (trechos):\n{kendra_context}\n\n"
-        f"TEXTO_GERAL (rascunho curto):\n{general_text or '(vazio)'}\n\n"
-        "Monte uma resposta única. Se usar o texto geral, inclua um bloco: "
-        "\"Complemento geral (sem fonte Kendra): ...\". "
-        "Ao final, inclua uma seção 'Fontes (Kendra):' listando as URIs quando houver; "
-        "se não houver, escreva 'Fontes (Kendra): (nenhuma)'."
-    )
-
-    final = _invoke_bedrock_any(synthesis_prompt, max_tokens=1200, temperature=0.2)
-    if not final.strip():
-        if kendra_snippets:
-            return (
-                "Não consegui sintetizar via modelo agora, mas encontrei trechos no Kendra.\n\n"
-                f"Fontes (Kendra):\n{fontes or '(nenhuma)'}"
-            )
-        return "Não encontrei informações no Kendra e não foi possível gerar um complemento agora."
-    if "Fontes (Kendra):" not in final:
-        final += "\n\nFontes (Kendra):\n" + (fontes or "(nenhuma)")
-    return final
-
-# ====================== ROTAS ======================
-@app.get("/ping")
-def ping():
-    return jsonify({"ok": True})
-
-@app.get("/env")
-def env_view():
-    return jsonify({
-        "region_bedrock": BEDROCK_REGION,
-        "region_kendra": KENDRA_REGION,
-        "kendra_index_id": KENDRA_INDEX_ID,
-        "kendra_language": KENDRA_LANGUAGE or "(none)",
-        "model": MODEL_IDENTIFIER,
-        "allow_creative": ALLOW_CREATIVE,
-    })
-
-@app.get("/kendra-stats")
-def kendra_stats():
-    try:
-        cli = kendra_client()
-        r = cli.describe_index(IndexId=KENDRA_INDEX_ID)
-        stats = r.get("IndexStatistics", {}).get("TextDocumentStatistics", {})
-        return jsonify(stats)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.get("/kendra-debug")
-def kendra_debug():
-    q = (request.args.get("q") or "").strip()
-    hits = retrieve_kendra(q, 12) if q else []
-    return jsonify({"query": q, "hits": hits})
-
-@app.post("/retrieve")
-def retrieve_only():
-    try:
-        data = request.get_json(force=True) or {}
-        q = (data.get("q") or data.get("message") or "").strip()
-        top_k = int(data.get("k") or 12)
-        if not q:
-            return jsonify({"error": "Informe 'q'"}), 400
-        hits = retrieve_kendra(q, top_k)
-        return jsonify({"hits": hits}), 200
-    except Exception as e:
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+                return json.loads(snippet)
+            except Exception:
+                pass
+        # fallback mínimo
+        return {"summary": raw[:400], "artifacts": {}, "sources": []}
 
 @app.post("/chat")
 def chat():
-    try:
-        miss = missing_env()
-        if miss:
-            return jsonify({"error": "Missing env vars", "missing": miss}), 500
+    data = request.get_json(force=True)
+    user_msg = (data.get("message") or "").strip()
+    if not user_msg:
+        return jsonify({"error": "Mensagem vazia."}), 400
 
-        data = request.get_json(force=True) or {}
-        user_msg = (data.get("message") or "").strip()
-        mode = (data.get("mode") or "strict").lower()
-        k = int(data.get("k") or 12)
+    # 1) Busca KB
+    ctx_chunks, sources = kendra_search(user_msg)
+    context = "\n\n---\n\n".join(ctx_chunks)
 
-        if not user_msg:
-            return jsonify({"error": "Body precisa conter JSON com o campo 'message'."}), 400
+    # 2) Prompt híbrido único
+    prompt = build_hybrid_prompt(user_msg, context)
 
-        # força strict se ALLOW_CREATIVE = false
-        if mode == "creative" and not ALLOW_CREATIVE:
-            mode = "strict"
+    # 3) Gera JSON estruturado
+    result = converse_json(prompt)
 
-        # 1) Retrieve no Kendra
-        k_hits = retrieve_kendra(user_msg, k)
-        citations = [{"uri": h["uri"], "score": h["score"]} for h in k_hits]
-        snippets  = [h["excerpt"] for h in k_hits]
+    # 4) Garante que as fontes retornem (mantemos as da KB)
+    if "sources" not in result or not isinstance(result["sources"], list) or len(result["sources"]) == 0:
+        result["sources"] = sources
+    else:
+        # mescla sem duplicar
+        seen = {(s.get("title"), s.get("url")) for s in result["sources"]}
+        for s in sources:
+            key = (s.get("title"), s.get("url"))
+            if key not in seen:
+                result["sources"].append(s)
 
-        # 2) Lógica de resposta
-        if mode == "strict":
-            if not snippets:
-                return jsonify({
-                    "answer": "Não encontrei informações sobre isso na base de conhecimento.",
-                    "citations": []
-                }), 200
-            answer = generate_with_bedrock_runtime(user_msg, snippets, creative=False)
-            if not answer.strip():
-                answer = "Não encontrei informações sobre isso na base de conhecimento."
-            return jsonify({"answer": answer, "citations": citations, "debug": {"mode": mode, "snippets": len(snippets)}}), 200
-
-        # CREATIVE
-        if snippets:
-            # Criativo COM contexto -> gera respeitando CONTEXTO e pode propor extras
-            answer = generate_with_bedrock_runtime(user_msg, snippets, creative=True)
-            return jsonify({"answer": answer, "citations": citations, "debug": {"mode": mode, "snippets": len(snippets)}}), 200
-        else:
-            # Criativo SEM contexto -> Proposta sem fontes
-            return jsonify({
-                "answer": "Proposta:\n\n" + generate_with_bedrock_runtime(user_msg, [], creative=True),
-                "citations": [],
-                "debug": {"mode": mode, "snippets": 0}
-            }), 200
-
-    except (BotoCoreError, ClientError) as e:
-        return jsonify({"error": "AWS error", "detail": str(e)}), 500
-    except Exception as e:
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
-
-# ====================== NOVO ENDPOINT: CHAT HÍBRIDO ======================
-@app.post("/chat-hybrid")
-def chat_hybrid():
-    """
-    Orquestração híbrida:
-    - Executa retrieve no Kendra e rascunho geral em paralelo
-    - Sintetiza resposta única priorizando Kendra e complementando quando necessário
-    """
-    try:
-        miss = missing_env()
-        if miss:
-            return jsonify({"error": "Missing env vars", "missing": miss}), 500
-
-        data = request.get_json(force=True) or {}
-        user_msg = (data.get("message") or data.get("q") or "").strip()
-        k = int(data.get("k") or 8)  # top-k menor para respostas mais focadas
-
-        if not user_msg:
-            return jsonify({"error": "Body precisa conter JSON com o campo 'message'."}), 400
-
-        # Executa Kendra e rascunho geral em paralelo
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            fut_kendra = ex.submit(retrieve_kendra, user_msg, k)
-            fut_draft  = ex.submit(general_draft, user_msg)
-
-            try:
-                k_hits = fut_kendra.result(timeout=18)
-            except Exception as e:
-                print("[hybrid] Kendra error:", e)
-                k_hits = []
-
-            try:
-                g_text = fut_draft.result(timeout=18)
-            except Exception as e:
-                print("[hybrid] draft error:", e)
-                g_text = ""
-
-        citations = [{"uri": h["uri"], "score": h["score"]} for h in k_hits]
-        snippets  = [h["excerpt"] for h in k_hits]
-
-        # Síntese final
-        final_answer = synthesize_hybrid_answer(user_msg, snippets, g_text, citations)
-
-        return jsonify({
-            "answer": final_answer,
-            "citations": citations,
-            "debug": {"mode": "hybrid", "snippets": len(snippets), "has_general": bool(g_text.strip())}
-        }), 200
-
-    except (BotoCoreError, ClientError) as e:
-        return jsonify({"error": "AWS error", "detail": str(e)}), 500
-    except Exception as e:
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+    return jsonify(result), 200
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8081"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=8081, debug=True)
