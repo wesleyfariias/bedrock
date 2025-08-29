@@ -44,28 +44,32 @@ logger.info(f"[Boot] region={REGION} model_id={MODEL_ID} fallbacks={MODEL_FALLBA
 # -----------------------------
 # Kendra 查询
 # -----------------------------
-def kendra_search(query: str, top_k: int = TOP_K) -> Tuple[List[str], List[Dict[str, Any]]]:
-    """Busca no Kendra, retorna (trechos, fontes). Não levanta exceção."""
+def kendra_search(query: str, top_k: int = TOP_K):
     if not KENDRA_INDEX_ID:
         return [], []
     try:
-        res = kendra.query(indexId=KENDRA_INDEX_ID, queryText=query, pageSize=top_k)
+        res = kendra.query(
+            IndexId=KENDRA_INDEX_ID,          # <-- PascalCase
+            QueryText=query,                  # <-- PascalCase
+            PageSize=top_k,                   # <-- PascalCase
+            # Opcional: peça atributos específicos do doc
+            RequestedDocumentAttributes=["DocumentURI", "DocumentTitle"]
+        )
     except Exception as e:
         logger.warning(f"[Kendra] query error: {e}")
         return [], []
 
-    ctx_chunks: List[str] = []
-    sources: List[Dict[str, Any]] = []
+    ctx_chunks, sources = [], []
     for item in res.get("ResultItems", []):
-        # Trecho
-        excerpt = item.get("DocumentExcerpt", {})
+        # Texto do trecho retornado
+        excerpt = item.get("DocumentExcerpt") or {}
         if "Text" in excerpt:
             ctx_chunks.append(excerpt["Text"])
 
         # Título
         title = (item.get("DocumentTitle") or {}).get("Text") or "Fonte sem título"
 
-        # URL
+        # URL (tente via atributos; nem todo conector preenche)
         link = None
         for attr in item.get("DocumentAttributes", []):
             if attr.get("Key") == "DocumentURI":
@@ -76,9 +80,8 @@ def kendra_search(query: str, top_k: int = TOP_K) -> Tuple[List[str], List[Dict[
 
         sources.append({"title": title, "url": link})
 
-    # Dedup simples de fontes (title, url)
-    seen = set()
-    deduped = []
+    # Dedup simples (title, url)
+    seen, deduped = set(), []
     for s in sources:
         key = (s.get("title"), s.get("url"))
         if key not in seen:
@@ -86,6 +89,7 @@ def kendra_search(query: str, top_k: int = TOP_K) -> Tuple[List[str], List[Dict[
             deduped.append(s)
 
     return ctx_chunks, deduped
+
 
 
 # -----------------------------
