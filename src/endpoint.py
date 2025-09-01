@@ -1,4 +1,3 @@
-# endpoint.py
 import os
 import re
 import json
@@ -9,31 +8,29 @@ import boto3
 from botocore.exceptions import ClientError
 from flask import Flask, request, jsonify
 
-# -----------------------------
-# Config
-# -----------------------------
+
 REGION = os.getenv("BEDROCK_REGION", "us-east-1")
-MODEL_ID = os.getenv("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
-# Separe múltiplos fallbacks por vírgula
+MODEL_ID = os.getenv("MODEL_ID", "anthropic.claude-v2:1")
+
 MODEL_FALLBACKS: List[str] = [
     m.strip() for m in os.getenv("MODEL_FALLBACKS", "").split(",") if m.strip()
 ]
 
 KENDRA_INDEX_ID = os.getenv("KENDRA_INDEX_ID", "")
 
-# Afinando comportamento
+
 TOP_K = int(os.getenv("KENDRA_TOP_K", "8"))
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "12000"))  # limita prompt
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "12000")) 
 TEXT_MAX_TOKENS = int(os.getenv("TEXT_MAX_TOKENS", "1400"))
 TEXT_TEMPERATURE = float(os.getenv("TEXT_TEMPERATURE", "0.5"))
 JSON_MAX_TOKENS = int(os.getenv("JSON_MAX_TOKENS", "1400"))
 JSON_TEMPERATURE = float(os.getenv("JSON_TEMPERATURE", "0.3"))
 
-# Logging
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("hybrid-backend")
 
-# AWS clients
+
 brt = boto3.client("bedrock-runtime", region_name=REGION)
 kendra = boto3.client("kendra", region_name=REGION)
 
@@ -41,18 +38,15 @@ app = Flask(__name__)
 logger.info(f"[Boot] region={REGION} model_id={MODEL_ID} fallbacks={MODEL_FALLBACKS} kendra_index={KENDRA_INDEX_ID}")
 
 
-# -----------------------------
-# Kendra 查询
-# -----------------------------
 def kendra_search(query: str, top_k: int = TOP_K):
     if not KENDRA_INDEX_ID:
         return [], []
     try:
         res = kendra.query(
-            IndexId=KENDRA_INDEX_ID,          # <-- PascalCase
-            QueryText=query,                  # <-- PascalCase
-            PageSize=top_k,                   # <-- PascalCase
-            # Opcional: peça atributos específicos do doc
+            IndexId=KENDRA_INDEX_ID,          
+            QueryText=query,                  
+            PageSize=top_k,                   
+            
             RequestedDocumentAttributes=["DocumentURI", "DocumentTitle"]
         )
     except Exception as e:
@@ -61,15 +55,15 @@ def kendra_search(query: str, top_k: int = TOP_K):
 
     ctx_chunks, sources = [], []
     for item in res.get("ResultItems", []):
-        # Texto do trecho retornado
+       
         excerpt = item.get("DocumentExcerpt") or {}
         if "Text" in excerpt:
             ctx_chunks.append(excerpt["Text"])
 
-        # Título
+        
         title = (item.get("DocumentTitle") or {}).get("Text") or "Fonte sem título"
 
-        # URL (tente via atributos; nem todo conector preenche)
+        
         link = None
         for attr in item.get("DocumentAttributes", []):
             if attr.get("Key") == "DocumentURI":
@@ -80,7 +74,7 @@ def kendra_search(query: str, top_k: int = TOP_K):
 
         sources.append({"title": title, "url": link})
 
-    # Dedup simples (title, url)
+    
     seen, deduped = set(), []
     for s in sources:
         key = (s.get("title"), s.get("url"))
@@ -92,9 +86,7 @@ def kendra_search(query: str, top_k: int = TOP_K):
 
 
 
-# -----------------------------
-# Prompts
-# -----------------------------
+
 HYBRID_MARKDOWN_INSTRUCTION = """
 Você é um assistente em PORTUGUÊS (estilo ChatGPT) com acesso opcional a uma BASE DE CONHECIMENTO (KB via Kendra).
 
@@ -164,9 +156,7 @@ def build_structured_prompt(user_msg: str, context: str) -> str:
 {context if context.strip() else "(sem resultados)"}"""
 
 
-# -----------------------------
-# Heurística: quando queremos JSON?
-# -----------------------------
+
 STRUCTURED_PATTERNS = [
     r"\bcasos?\s+de\s+teste\b",
     r"\btest\s*cases?\b",
@@ -184,9 +174,7 @@ def wants_structured(user_msg: str) -> bool:
     return any(rx.search(um) for rx in STRUCTURED_REGEXES)
 
 
-# -----------------------------
-# Bedrock helpers (converse + fallback)
-# -----------------------------
+
 def try_converse_any(prompt: str, max_tokens: int, temperature: float) -> Tuple[str, str]:
     """
     Tenta chamar bedrock.converse com o MODEL_ID principal e fallbacks.
@@ -210,10 +198,10 @@ def try_converse_any(prompt: str, max_tokens: int, temperature: float) -> Tuple[
             msg = e.response.get("Error", {}).get("Message")
             logger.warning(f"[Bedrock] {mid} failed: {code} - {msg}")
             last_err = e
-            # AccessDenied / ModelNotReady / Throttling → tenta próximo
+           
             if code in ("AccessDeniedException", "ModelNotReadyException", "ThrottlingException"):
                 continue
-            # Outros erros: não adianta tentar o próximo (provavelmente de sintaxe)
+            
             raise
     if last_err:
         raise last_err
@@ -226,29 +214,27 @@ def converse_text(prompt: str, max_tokens: int = TEXT_MAX_TOKENS, temperature: f
 
 def converse_json(prompt: str, max_tokens: int = JSON_MAX_TOKENS, temperature: float = JSON_TEMPERATURE) -> Dict[str, Any]:
     raw, used_model = try_converse_any(prompt, max_tokens, temperature)
-    # Tenta parsear direto
+    
     try:
         return json.loads(raw)
     except Exception:
-        # Heurística: extrai o maior bloco { ... }
+        
         s, e = raw.find("{"), raw.rfind("}")
         if s != -1 and e != -1 and e > s:
             try:
                 return json.loads(raw[s:e+1])
             except Exception:
                 pass
-        # Fallback mínimo
+        
         return {"summary": raw[:800], "artifacts": {}, "sources": []}
 
 
-# -----------------------------
-# Utilidades
-# -----------------------------
+
 def build_context_text(chunks: List[str]) -> str:
     if not chunks:
         return ""
     text = "\n\n---\n\n".join(chunks[:TOP_K])
-    # Limita tamanho
+    
     if len(text) > MAX_CONTEXT_CHARS:
         text = text[:MAX_CONTEXT_CHARS] + "\n\n---(truncado)---"
     return text
@@ -256,11 +242,11 @@ def build_context_text(chunks: List[str]) -> str:
 def append_sources_if_missing(answer_md: str, sources: List[Dict[str, Any]]) -> str:
     """Se o modelo não colocou 'Fontes' e temos KB, anexa no final."""
     if not sources:
-        # Se não há fontes e não há menção, adicione linha neutra para padronizar
+        
         if "Fontes" not in answer_md:
             return answer_md.rstrip() + "\n\n**Fontes**\n(sem fontes da KB)\n"
         return answer_md
-    # Já incluiu 'Fontes'? mantenha
+    
     if "Fontes" in answer_md:
         return answer_md
     lines = []
@@ -282,9 +268,7 @@ def merge_sources(primary: List[Dict[str, Any]], extra: List[Dict[str, Any]]) ->
     return merged
 
 
-# -----------------------------
-# HTTP endpoints
-# -----------------------------
+
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True})
@@ -309,24 +293,24 @@ def chat():
     if not user_msg:
         return jsonify({"text": "Mensagem vazia."}), 200
 
-    # 1) Busca KB
+   
     ctx_chunks, kb_sources = kendra_search(user_msg)
     context = build_context_text(ctx_chunks)
 
-    # 2) Decide formato da resposta
+   
     structured = wants_structured(user_msg)
 
     try:
         if structured:
-            # JSON estruturado (só quando a tarefa pede)
+            
             prompt = build_structured_prompt(user_msg, context)
             result = converse_json(prompt, max_tokens=JSON_MAX_TOKENS, temperature=JSON_TEMPERATURE)
-            # fontes: mescla as do modelo com as da KB (sem duplicar)
+           
             result_sources = result.get("sources") or []
             result["sources"] = merge_sources(result_sources, kb_sources)
             return jsonify(result), 200
 
-        # Markdown genérico (estilo ChatGPT com KB)
+        
         prompt = build_markdown_prompt(user_msg, context)
         answer = converse_text(prompt, max_tokens=TEXT_MAX_TOKENS, temperature=TEXT_TEMPERATURE)
         answer = append_sources_if_missing(answer, kb_sources)
@@ -336,7 +320,7 @@ def chat():
         code = e.response.get("Error", {}).get("Code")
         msg = e.response.get("Error", {}).get("Message")
         logger.error(f"[BedrockError] {code}: {msg}")
-        # Devolve erro amigável (front mostra na bolha)
+        
         return jsonify({
             "text": (
                 "Falha ao invocar o modelo do Bedrock.\n\n"
@@ -351,9 +335,7 @@ def chat():
         return jsonify({"text": f"Erro inesperado no servidor: {ex}", "sources": []}), 200
 
 
-# -----------------------------
-# Run
-# -----------------------------
+
 if __name__ == "__main__":
-    # Dica: use host=0.0.0.0 para permitir acesso externo (Next com rewrite)
+    
     app.run(host="0.0.0.0", port=8081, debug=True)
