@@ -97,7 +97,7 @@ export default function BedrockClaudeChat() {
     {
       role: 'assistant',
       content:
-        'Olá! Envie sua User Story ou pergunta. Vou usar a base (KB) e complementar criativamente quando necessário.',
+        'Olá! Envie sua pergunta. Vou usar a base (KB) e complementar criativamente quando necessário.',
     },
   ]);
   const [lastCitations, setLastCitations] = useState<Citation[]>([]);
