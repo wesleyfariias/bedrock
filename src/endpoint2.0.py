@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 # --- Config ---
 REGION = os.getenv("AWS_REGION", "us-east-1")
-S3_KNOW = os.getenv("S3_KNOW", "pmesp-ai-knowledge")
+S3_KNOW = os.getenv("S3_KNOW", "base-de-dados-bedrock")
 S3_OUT = os.getenv("S3_OUT", "pmesp-ai-outputs")
 MODEL_ID = os.getenv("MODEL_ID", "anthropic.claude-v2:1")  # Claude 2.1
 KENDRA_INDEX_ID = os.getenv("KENDRA_INDEX_ID")  # pode estar vazio
