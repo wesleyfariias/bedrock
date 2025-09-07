@@ -90,7 +90,7 @@ class ChatMsg(BaseModel):
     role: Literal["user", "assistant"]
     content: str
 
-
+# ajuste
 class ChatIn(BaseModel):
     messages: List[ChatMsg]
 
