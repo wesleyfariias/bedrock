@@ -1,15 +1,14 @@
 import type { NextConfig } from "next";
 
+const API = process.env.NEXT_PUBLIC_API ?? "http://127.0.0.1:8081";
+
 const nextConfig: NextConfig = {
   async rewrites() {
     return [
-      { source: "/api/chat", destination: "http://127.0.0.1:8081/chat" },
+      // envia /api/... -> FastAPI
+      { source: "/api/:path*", destination: `${API}/:path*` },
     ];
   },
 };
 
-export default {
-  async rewrites() {
-    return [{ source: '/api/chat', destination: 'http://127.0.0.1:8081/chat' }];
-  },
-};
+export default nextConfig;
