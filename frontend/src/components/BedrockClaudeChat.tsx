@@ -11,7 +11,7 @@ export type Msg = { role: 'user' | 'assistant'; content: string };
 type ChatResponse = {
   answer?: string;
   kendra_sources?: string[];
-  saved?: string | null;
+  saved?: string | null; // ignorado no front
 };
 
 type GenPreview = {
@@ -20,12 +20,7 @@ type GenPreview = {
   notice: string;
 };
 
-type GenSaved = {
-  saved: string; // s3 uri
-  meta?: Record<string, unknown>;
-};
-
-// Mensagem estendida para suportar "prévia + aprovar" dentro do chat
+// Mensagem estendida para suportar "prévia" dentro do chat (sem aprovar/S3)
 type UiMsg = {
   role: 'user' | 'assistant';
   content: string;
@@ -33,9 +28,6 @@ type UiMsg = {
   previewKind?: 'story' | 'rtr';
   previewBody?: string;
   kendra_sources?: string[];
-  approvePayload?: any;
-  savedUri?: string | null;
-  error?: string | null;
 };
 
 // ------------------------------------------------------------
@@ -98,8 +90,7 @@ const BedrockClaudeChatUnified: FC = () => {
       content:
         'Olá! Eu consigo conversar normalmente e também gerar artefatos via comandos. Exemplos:\n' +
         '• /story <objetivo> | ctx: <contexto opcional>\n' +
-        '• /rtr <objetivo> | ctx: <contexto opcional>\n' +
-        'Depois que eu mostrar a prévia, clique em “Aprovar & Salvar no S3”.',
+        '• /rtr <objetivo> | ctx: <contexto opcional>\n',
     },
   ]);
   const [input, setInput] = useState('');
@@ -140,7 +131,7 @@ const BedrockClaudeChatUnified: FC = () => {
       setLoading(true);
       try {
         const api = kind === 'story' ? API.story : API.rtr;
-        const payload = { objetivo, contexto: contexto || null, approve: false };
+        const payload = { objetivo, contexto: contexto || null }; // sem approve
         const res = await fetch(api, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -158,14 +149,13 @@ const BedrockClaudeChatUnified: FC = () => {
           previewKind: kind,
           previewBody,
           kendra_sources: data.kendra_sources,
-          approvePayload: { ...payload, approve: true },
         };
         setMessages((prev) => [...prev, previewMsg]);
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Erro desconhecido';
         setMessages((prev) => [
           ...prev,
-          { role: 'assistant', content: 'Falha ao gerar prévia.', error: msg },
+          { role: 'assistant', content: `Falha ao gerar prévia: ${msg}` },
         ]);
       } finally {
         setLoading(false);
@@ -189,12 +179,15 @@ const BedrockClaudeChatUnified: FC = () => {
       const data = (await res.json()) as ChatResponse;
       const answer = cleanMultiline((data.answer || '').trim());
       setMessages((prev) => [...prev, { role: 'assistant', content: answer || '—' }]);
-      // opcional: você pode renderizar fontes do Kendra como outra mensagem, se quiser
+      // opcional: renderizar fontes do Kendra
       if (data.kendra_sources?.length) {
         setMessages((prev) => [
           ...prev,
           { role: 'assistant', content: 'Fontes:' },
-          { role: 'assistant', content: (data.kendra_sources || []).map((s) => `• ${s}`).join('\n') },
+          {
+            role: 'assistant',
+            content: (data.kendra_sources || []).map((s) => `• ${s}`).join('\n'),
+          },
         ]);
       }
     } catch (e) {
@@ -211,27 +204,6 @@ const BedrockClaudeChatUnified: FC = () => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       void onSend();
-    }
-  }
-
-  async function onApprove(msg: UiMsg) {
-    if (!msg.previewKind || !msg.approvePayload) return;
-    const api = msg.previewKind === 'story' ? API.story : API.rtr;
-    try {
-      const res = await fetch(api, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(msg.approvePayload),
-      });
-      if (!res.ok) {
-        const errTxt = await safeReadText(res);
-        throw new Error(errTxt || `HTTP ${res.status}`);
-      }
-      const data = (await res.json()) as GenSaved;
-      setMessages((prev) => prev.map((m) => (m === msg ? { ...m, savedUri: data.saved } : m)));
-    } catch (e) {
-      const err = e instanceof Error ? e.message : 'Erro ao salvar';
-      setMessages((prev) => prev.map((m) => (m === msg ? { ...m, error: err } : m)));
     }
   }
 
@@ -257,7 +229,9 @@ const BedrockClaudeChatUnified: FC = () => {
         <header className="flex items-center justify-between border-b pb-3 mb-4">
           <div>
             <h1 className="text-lg font-semibold text-gray-900">Assistente PMESP – Chat único</h1>
-            <p className="text-xs text-gray-600">Converse normalmente ou use comandos para gerar artefatos (prévia ➜ aprovar ➜ salvar no S3).</p>
+            <p className="text-xs text-gray-600">
+              Converse normalmente ou use comandos para gerar artefatos (exibe prévia em texto – sem salvar no S3).
+            </p>
           </div>
           <button
             type="button"
@@ -271,7 +245,7 @@ const BedrockClaudeChatUnified: FC = () => {
         <section>
           <div className="mb-3">
             <span className="inline-flex items-center text-[11px] px-2 py-1 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
-              /api/chat para conversa • /api/gen/user-story e /api/gen/rtr para comandos
+              /api/chat para conversa • /api/gen/user-story e /api/gen/rtr geram apenas a prévia (sem upload)
             </span>
           </div>
 
@@ -313,20 +287,14 @@ const BedrockClaudeChatUnified: FC = () => {
                         </div>
                       )}
 
-                      <div className="mt-2 flex gap-2">
+                      <div className="mt-2">
                         <button
-                          className="px-3 py-1.5 text-sm rounded bg-indigo-600 text-white disabled:opacity-50 hover:bg-indigo-700"
-                          onClick={() => onApprove(m)}
-                          disabled={!!m.savedUri}
+                          type="button"
+                          className="px-3 py-1.5 text-sm rounded bg-gray-200 hover:bg-gray-300 text-gray-800"
+                          onClick={() => navigator.clipboard.writeText(m.previewBody ?? '')}
                         >
-                          Aprovar & Salvar no S3
+                          Copiar texto
                         </button>
-                        {m.savedUri && (
-                          <span className="text-xs text-gray-700">Salvo em: <code>{m.savedUri}</code></span>
-                        )}
-                        {m.error && (
-                          <span className="text-xs text-red-700">{m.error}</span>
-                        )}
                       </div>
                     </div>
                   ) : (
