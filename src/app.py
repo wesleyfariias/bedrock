@@ -1,6 +1,3 @@
-# app-no-s3.py — FastAPI sem fluxo de aprovação/S3
-# Gera documentos (User Story, RTR) e devolve o markdown diretamente
-
 import os
 import json
 import re
@@ -13,19 +10,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from botocore.exceptions import ClientError
 
-# --- Config ---
 REGION = os.getenv("AWS_REGION", "us-east-1")
-MODEL_ID = os.getenv("MODEL_ID", "anthropic.claude-v2:1")  # Claude 2.1
-KENDRA_INDEX_ID = os.getenv("KENDRA_INDEX_ID")  # opcional
+MODEL_ID = os.getenv("MODEL_ID", "amazon.titan-text-premier-v1:0")
+KENDRA_INDEX_ID = os.getenv("KENDRA_INDEX_ID")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
-# --- AWS clients ---
-s3 = boto3.client("s3", region_name=REGION)  # não usamos diretamente, mas mantém compat p/ futuro
+s3 = boto3.client("s3", region_name=REGION)
 kendra = boto3.client("kendra", region_name=REGION)
 bedrock = boto3.client("bedrock-runtime", region_name=REGION)
 
-# --- FastAPI ---
-app = FastAPI(title="PMESP AI Orchestrator (Kendra + Claude 2.1) — Sem S3")
+app = FastAPI(title="PMESP AI Orchestrator (Kendra + Titan G1 Premier)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -34,7 +28,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Helpers ---
 def kendra_search(query: str, top_k: int = 8) -> List[Dict[str, str]]:
     if not KENDRA_INDEX_ID:
         return []
@@ -43,7 +36,6 @@ def kendra_search(query: str, top_k: int = 8) -> List[Dict[str, str]]:
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         if code in ("AccessDeniedException", "ValidationException"):
-            print(f"[KENDRA] fallback sem contexto: {code} - {e}")
             return []
         raise
     chunks = []
@@ -55,14 +47,14 @@ def kendra_search(query: str, top_k: int = 8) -> List[Dict[str, str]]:
             chunks.append({"title": title, "text": text, "source": src})
     return chunks
 
-
-def bedrock_claude21(system: str, user_prompt: str, max_tokens: int = 2000, temperature: float = 0.2) -> str:
-    prompt = f"\n\nHuman: {system}\n\n{user_prompt}\n\nAssistant:"
+def bedrock_titan(system: str, user_prompt: str, max_tokens: int = 2000, temperature: float = 0.2) -> str:
     body = {
-        "prompt": prompt,
-        "max_tokens_to_sample": max_tokens,
-        "temperature": temperature,
-        "stop_sequences": ["\n\nHuman:"],
+        "inputText": f"{system}\n\n{user_prompt}",
+        "textGenerationConfig": {
+            "maxTokenCount": max_tokens,
+            "temperature": temperature,
+            "stopSequences": []
+        }
     }
     try:
         resp = bedrock.invoke_model(
@@ -72,10 +64,9 @@ def bedrock_claude21(system: str, user_prompt: str, max_tokens: int = 2000, temp
             body=json.dumps(body),
         )
         out = json.loads(resp["body"].read())
-        return out.get("completion", "").strip()
+        return out["results"][0]["outputText"].strip()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Bedrock invoke error: {e}")
-
 
 SYSTEM = (
     "Você é o Assistente de Engenharia da PMESP.\n"
@@ -85,22 +76,17 @@ SYSTEM = (
     "- Responda em português claro e direto."
 )
 
-# --- Schemas ---
 class ChatMsg(BaseModel):
     role: Literal["user", "assistant"]
     content: str
 
-# ajuste
 class ChatIn(BaseModel):
     messages: List[ChatMsg]
-
 
 class GenIn(BaseModel):
     objetivo: str
     contexto: Optional[str] = None
 
-
-# --- Endpoints ---
 @app.get("/health")
 def health():
     return {
@@ -110,10 +96,8 @@ def health():
         "kendra_index_set": bool(KENDRA_INDEX_ID),
     }
 
-
 @app.post("/chat")
 def chat(inp: ChatIn):
-    # última mensagem do usuário vira a query para o Kendra
     user_query = next((m.content for m in reversed(inp.messages) if m.role == "user"), "")
     context_hits = kendra_search(user_query, top_k=6) if user_query else []
     ctx_text = (
@@ -121,11 +105,9 @@ def chat(inp: ChatIn):
         if context_hits
         else "(Sem contexto do Kendra disponível)"
     )
-
     transcript = "\n".join(
         [f"Usuário: {m.content}" if m.role == "user" else f"Assistente: {m.content}" for m in inp.messages]
     )
-
     user_prompt = (
         "Contexto do Kendra (quando houver, use para embasar a resposta e cite as fontes ao final):\n"
         f"{ctx_text}\n\n"
@@ -136,11 +118,8 @@ def chat(inp: ChatIn):
         "- Se faltar informação, faça perguntas diretas e sucintas.\n"
         "- Não invente políticas internas; respeite padrões da PMESP quando aparecerem no contexto."
     )
-
-    completion = bedrock_claude21(system=SYSTEM, user_prompt=user_prompt, max_tokens=1500, temperature=0.2)
-
+    completion = bedrock_titan(system=SYSTEM, user_prompt=user_prompt, max_tokens=1500, temperature=0.2)
     return {"answer": completion, "kendra_sources": [c["source"] for c in context_hits]}
-
 
 @app.post("/gen/user-story")
 def gen_user_story(inp: GenIn):
@@ -151,7 +130,6 @@ def gen_user_story(inp: GenIn):
         if context
         else "(Sem contexto do Kendra disponível)"
     )
-
     prompt = (
         "Contexto do Kendra (use como referência e cite as fontes ao final):\n"
         f"{ctx_text}\n\n"
@@ -160,10 +138,8 @@ def gen_user_story(inp: GenIn):
         "Se faltar dado, inclua seção 'Perguntas' com dúvidas objetivas.\n"
         "Inclua ao final uma seção 'Fontes' com os paths do contexto."
     )
-
-    out = bedrock_claude21(system=SYSTEM, user_prompt=prompt, max_tokens=2000, temperature=0.2)
+    out = bedrock_titan(system=SYSTEM, user_prompt=prompt, max_tokens=2000, temperature=0.2)
     return {"content": out, "kendra_sources": [c["source"] for c in context]}
-
 
 @app.post("/gen/rtr")
 def gen_rtr(inp: GenIn):
@@ -174,7 +150,6 @@ def gen_rtr(inp: GenIn):
         if context
         else "(Sem contexto do Kendra disponível)"
     )
-
     prompt = (
         "Contexto do Kendra (use como referência e cite as fontes ao final):\n"
         f"{ctx_text}\n\n"
@@ -185,12 +160,9 @@ def gen_rtr(inp: GenIn):
         "Se faltar dado, inclua uma seção 'Perguntas' com dúvidas objetivas.\n"
         "Inclua ao final uma seção 'Fontes' com os paths do contexto."
     )
-
-    out = bedrock_claude21(system=SYSTEM, user_prompt=prompt, max_tokens=2000, temperature=0.2)
+    out = bedrock_titan(system=SYSTEM, user_prompt=prompt, max_tokens=2000, temperature=0.2)
     return {"content": out, "kendra_sources": [c["source"] for c in context]}
-
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8081")), reload=True)
